@@ -3,8 +3,25 @@
 #include <Adafruit_NeoPixel.h>
 
 // ============================================================
-// PASS THE BOMB - XIAO RP2040
+// PASS THE BOMB - XIAO RP2040 - DUAL CORE VERSION
 // 1.3" SH1106 128x64 OLED + 4 piezos + buzzer + NeoPixel
+//
+// CORE 0 (setup/loop):   senses all 4 piezos continuously, at
+//                        full speed, and pushes tap events
+//                        (channel + peak strength) to Core 1
+//                        over the RP2040's hardware FIFO. It
+//                        NEVER touches the display, buzzer,
+//                        NeoPixel, or game state.
+//
+// CORE 1 (setup1/loop1): owns the OLED, buzzer, onboard LED,
+//                        NeoPixel, and the entire calibration
+//                        + gameplay state machine. It reacts to
+//                        tap events instead of reading the
+//                        piezos itself.
+//
+// This split is the actual point of the assignment: one core
+// dedicated to high-speed sensing, the other to display/logic,
+// running truly in parallel rather than time-sliced in one loop.
 // ============================================================
 
 // XIAO RP2040 hardware I2C:
@@ -32,8 +49,6 @@ const uint16_t MIN_TAP_LEVEL = 75;
 const uint16_t MAX_TAP_THRESHOLD = 450;
 const uint16_t BASELINE_MARGIN = 35;
 const uint16_t TAP_COOLDOWN = 120;
-const uint16_t CAL_WINDOW = 45;
-const uint16_t GAME_WINDOW = 18;
 
 const unsigned long MIN_BOMB = 300;
 const unsigned long MAX_BOMB = 5000;
@@ -44,14 +59,84 @@ const uint8_t EXP_FRAMES = 7;
 const unsigned long TITLE_TIME = 2000;
 const unsigned long ELIM_TIME = 1500;
 const unsigned long WIN_TIME = 3500;
-const unsigned long CAL_SWITCH_DELAY = 900; // pause before moving to the next player
+const unsigned long CAL_SWITCH_DELAY = 900;
 
-// Calibration isolation: only the assigned player's piezo may advance calibration.
-// All four piezos are sampled and the assigned channel must clearly dominate.
+// Calibration isolation: the assigned player's channel must
+// clearly dominate any other channel that fired around the same
+// time (real cross-talk from a shared mounting surface).
 const uint16_t CAL_CROSS_MARGIN = 50;
 const uint8_t CAL_DOM_NUM = 5;       // target >= 1.25x strongest other sensor
 const uint8_t CAL_DOM_DEN = 4;
 const unsigned long CAL_TAP_LOCKOUT = 300;
+const unsigned long CROSS_TALK_WINDOW_MS = 80; // "around the same time" window
+
+// ============================================================
+// CORE 0 <-> CORE 1 EVENT FORMAT
+// Packed into a uint32_t: [channel:8][peak strength:16][unused:8]
+// ============================================================
+uint32_t packEvent(uint8_t ch, uint16_t strength) {
+  return ((uint32_t)ch << 24) | ((uint32_t)strength << 8);
+}
+void unpackEvent(uint32_t packed, uint8_t &ch, uint16_t &strength) {
+  ch = (packed >> 24) & 0xFF;
+  strength = (packed >> 8) & 0xFFFF;
+}
+
+// ============================================================
+// CORE 0 - SENSING ONLY
+// ============================================================
+const int           CORE0_DETECT_FLOOR = 55; // low universal floor - opens a strike window
+const unsigned long STRIKE_WINDOW_MS   = 5;  // peak-hold window per tap, for an accurate reading
+const unsigned long CORE0_REFRACTORY_MS = 60; // short - real per-purpose cooldowns are enforced on Core 1
+
+int           peak0[4]        = {0,0,0,0};
+bool          windowOpen0[4]  = {false,false,false,false};
+unsigned long windowStart0[4] = {0,0,0,0};
+unsigned long refractory0[4]  = {0,0,0,0};
+
+// Continuously-refreshed raw snapshot, for Core 1's baseline
+// averaging and the initial random seed. Written only by Core 0,
+// read-only from Core 1 - safe without a mutex since single
+// 16-bit reads/writes are atomic on this chip and a slightly
+// stale value here costs nothing (it's only used for averaging
+// and seeding, never for tap decisions).
+volatile uint16_t currentReading[4] = {0,0,0,0};
+
+void setup() {
+  for (uint8_t i=0;i<4;i++) pinMode(PIEZO[i], INPUT);
+  analogReadResolution(10);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  for (uint8_t ch=0; ch<4; ch++) {
+    int v = analogRead(PIEZO[ch]);
+    currentReading[ch] = v;
+
+    if (now < refractory0[ch]) continue;
+
+    if (!windowOpen0[ch]) {
+      if (v > CORE0_DETECT_FLOOR) {
+        windowOpen0[ch] = true;
+        windowStart0[ch] = now;
+        peak0[ch] = v;
+      }
+    } else {
+      if (v > peak0[ch]) peak0[ch] = v;
+      if (now - windowStart0[ch] >= STRIKE_WINDOW_MS) {
+        rp2040.fifo.push(packEvent(ch, peak0[ch]));
+        refractory0[ch] = now + CORE0_REFRACTORY_MS;
+        windowOpen0[ch] = false;
+        peak0[ch] = 0;
+      }
+    }
+  }
+}
+
+// ============================================================
+// CORE 1 - CALIBRATION, GAMEPLAY, DISPLAY, SOUND, LIGHTS
+// ============================================================
 
 enum State { TITLE, CAL_BASE, CAL_TAPS, CAL_WAIT, READY, PLAYING, PASSING,
              EXPLOSION, ELIMINATED, WIN };
@@ -87,6 +172,17 @@ uint32_t pixelRestore = 0;
 const int PX[4] = {2, 98, 98, 2};
 const int PY[4] = {12, 12, 44, 44};
 
+// Most recent event seen per channel, and when - fed by draining
+// the FIFO once per loop1() pass. This replaces the old "sample
+// all 4 piezos live" approach with recent event history, which is
+// the natural fit once sensing lives on the other core.
+uint16_t lastEventPeak[4] = {0,0,0,0};
+unsigned long lastEventTime[4] = {0,0,0,0};
+
+struct TapEvent { uint8_t ch; uint16_t strength; };
+TapEvent frameEvents[8];
+uint8_t frameEventCount = 0;
+
 // ---------- declarations ----------
 void showTitle();
 void startCalibration();
@@ -94,16 +190,15 @@ void processCalibration();
 void drawCalibration();
 void showCalibrationSummary();
 
-uint16_t peakRead(uint8_t p, unsigned long ms);
+void drainFifo();
 uint16_t baselineRead(uint8_t p);
-void readAllCalibrationPeaks(uint16_t peaks[4], unsigned long ms);
-bool calibrationTapIsForPlayer(const uint16_t peaks[4], uint8_t target);
-int detectAnyTap();
+bool evaluateCalibrationTap(uint8_t target, uint16_t targetPeak);
+int detectAnyTapFromEvents(uint16_t *outPeak);
 
 void startReady();
-void processReady(int &tapResult);
 void startGame(uint8_t starter);
 void processGame();
+void enterPlayingEffects();
 
 void startPassing(uint8_t next);
 void processPassing();
@@ -117,6 +212,7 @@ void processWin();
 void drawPlayerSlot(uint8_t p, bool holder, bool elim);
 void drawPlayerIcon(int cx, int cy, bool elim, bool active);
 void drawBomb(int x, int y, bool burst);
+void drawGameplay();
 void drawCentered(const char *s, int y);
 void drawX(int cx, int cy, int s);
 void drawBurst(int cx, int cy, uint8_t frame);
@@ -140,20 +236,19 @@ uint8_t randomOtherAlive(uint8_t from);
 void seedRandom();
 
 // ============================================================
-// SETUP
+// SETUP1
 // ============================================================
-void setup() {
+void setup1() {
   Serial.begin(115200);
+  unsigned long t0 = millis();
+  while (!Serial && millis() - t0 < 2000) { /* wait briefly for USB serial */ }
 
   Serial.println();
-  Serial.println("=== PASS THE BOMB HARDWARE CHECK ===");
+  Serial.println("=== PASS THE BOMB - DUAL CORE ===");
+  Serial.println("Core 0: senses all 4 piezos continuously");
+  Serial.println("Core 1: display, buzzer, LEDs, game logic");
   Serial.println("OLED I2C: D4/GPIO6 SDA, D5/GPIO7 SCL");
   Serial.println("BUZZER:   D6/GPIO0");
-  Serial.println("IMPORTANT: buzzer no longer shares OLED SDA");
-
-  analogReadResolution(10);
-
-  for (uint8_t i=0;i<4;i++) pinMode(PIEZO[i], INPUT);
 
   pinMode(BUZZER, OUTPUT);
   digitalWrite(BUZZER, LOW);
@@ -168,6 +263,7 @@ void setup() {
   pixel.show();
 
   displayOK = oled.begin();
+  Serial.println(displayOK ? "OLED init OK." : "OLED init FAILED.");
   if (displayOK) {
     oled.setPowerSave(0);
     oled.clearBuffer();
@@ -182,9 +278,10 @@ void setup() {
 }
 
 // ============================================================
-// LOOP
+// LOOP1
 // ============================================================
-void loop() {
+void loop1() {
+  drainFifo();
   updatePixel();
 
   switch (state) {
@@ -199,7 +296,8 @@ void loop() {
       break;
 
     case READY: {
-      int t = detectAnyTap();
+      uint16_t peak;
+      int t = detectAnyTapFromEvents(&peak);
       if (t >= 0) startGame((uint8_t)t);
       break;
     }
@@ -223,6 +321,26 @@ void loop() {
     case WIN:
       processWin();
       break;
+  }
+}
+
+// Drain every event Core 0 has queued since the last pass. Keeping
+// ALL of them (not just the latest) matters: two events can arrive
+// in the same pass (a real tap plus a cross-talk blip), and only
+// looking at the last one popped can silently discard the real tap.
+void drainFifo() {
+  frameEventCount = 0;
+  while (rp2040.fifo.available() && frameEventCount < 8) {
+    uint32_t packed = rp2040.fifo.pop();
+    uint8_t ch; uint16_t strength;
+    unpackEvent(packed, ch, strength);
+
+    lastEventPeak[ch] = strength;
+    lastEventTime[ch] = millis();
+
+    frameEvents[frameEventCount].ch = ch;
+    frameEvents[frameEventCount].strength = strength;
+    frameEventCount++;
   }
 }
 
@@ -270,65 +388,69 @@ void startCalibration() {
   delay(350);
 }
 
+// Averages Core 0's continuously-refreshed snapshot instead of
+// reading the ADC directly - Core 1 never touches the piezo pins.
 uint16_t baselineRead(uint8_t p) {
   unsigned long st=millis();
   uint32_t total=0;
   uint16_t n=0;
   while (millis()-st < 220) {
-    total += analogRead(PIEZO[p]);
+    total += currentReading[p];
     n++;
     delayMicroseconds(500);
   }
   return n ? total/n : 0;
 }
 
-uint16_t peakRead(uint8_t p, unsigned long ms) {
-  uint16_t peak=0;
-  unsigned long st=micros();
-  while (micros()-st < ms*1000UL) {
-    uint16_t v=analogRead(PIEZO[p]);
-    if (v>peak) peak=v;
-  }
-  return peak;
-}
-
-// ============================================================
-// CALIBRATION INPUT ISOLATION
-// ============================================================
-// Read ALL FOUR sensors during calibration. Reading only the requested
-// player's sensor allows a different player's mechanical tap to appear
-// as a valid tap through cross-coupling.
-void readAllCalibrationPeaks(uint16_t peaks[4], unsigned long ms) {
-  for (uint8_t p = 0; p < 4; p++) peaks[p] = 0;
-
-  unsigned long st = micros();
-  while (micros() - st < ms * 1000UL) {
-    for (uint8_t p = 0; p < 4; p++) {
-      uint16_t v = analogRead(PIEZO[p]);
-      if (v > peaks[p]) peaks[p] = v;
-    }
-  }
-}
-
-// The assigned player's sensor must be both above its own threshold and
-// clearly stronger than every other sensor.
-bool calibrationTapIsForPlayer(const uint16_t peaks[4], uint8_t target) {
-  uint16_t targetPeak = peaks[target];
+// The assigned player's tap must be both above its own threshold
+// and clearly stronger than anything else that fired recently
+// (the "recently" substitutes for the old live 4-channel snapshot,
+// since sensing now happens on the other core).
+bool evaluateCalibrationTap(uint8_t target, uint16_t targetPeak) {
+  unsigned long now = millis();
   uint16_t strongestOther = 0;
+  uint8_t strongestOtherPlayer = 255;
 
   for (uint8_t p = 0; p < 4; p++) {
     if (p == target) continue;
-    if (peaks[p] > strongestOther) strongestOther = peaks[p];
+    if (now - lastEventTime[p] <= CROSS_TALK_WINDOW_MS && lastEventPeak[p] > strongestOther) {
+      strongestOther = lastEventPeak[p];
+      strongestOtherPlayer = p;
+    }
   }
 
   uint16_t required = baseline[target] + BASELINE_MARGIN;
   if (required < MIN_TAP_LEVEL) required = MIN_TAP_LEVEL;
 
-  if (targetPeak < required) return false;
-  if (targetPeak < strongestOther + CAL_CROSS_MARGIN) return false;
+  bool strongEnough = targetPeak >= required;
+  bool hasMargin = targetPeak >= (uint16_t)(strongestOther + CAL_CROSS_MARGIN);
+  bool hasDominance = ((uint32_t)targetPeak * CAL_DOM_DEN >=
+                        (uint32_t)strongestOther * CAL_DOM_NUM);
 
-  return ((uint32_t)targetPeak * CAL_DOM_DEN >=
-          (uint32_t)strongestOther * CAL_DOM_NUM);
+  if (targetPeak >= MIN_TAP_LEVEL || strongestOther >= MIN_TAP_LEVEL) {
+    Serial.print("CAL P"); Serial.print(target + 1);
+    Serial.print(" target="); Serial.print(targetPeak);
+    Serial.print(" strongestOther=");
+    if (strongestOtherPlayer != 255) {
+      Serial.print("P"); Serial.print(strongestOtherPlayer + 1);
+      Serial.print("="); Serial.print(strongestOther);
+    } else {
+      Serial.print("none");
+    }
+    Serial.println();
+
+    if (strongestOtherPlayer != 255 && strongestOther > targetPeak) {
+      Serial.print("REJECTED: likely cross-talk from P");
+      Serial.println(strongestOtherPlayer + 1);
+      return false;
+    }
+    if (strongEnough && (!hasMargin || !hasDominance)) {
+      Serial.println("REJECTED: ambiguous/cross-coupled signal.");
+      return false;
+    }
+  }
+
+  return strongEnough && hasMargin && hasDominance;
 }
 
 void drawCalibration() {
@@ -466,158 +588,83 @@ void processCalibration() {
   // One physical tap cannot count twice.
   if (millis() - lastTap < CAL_TAP_LOCKOUT) return;
 
-  // ----------------------------------------------------------
-  // KEY FIX: SAMPLE ALL FOUR PIEZOS, NOT JUST calPlayer.
-  // ----------------------------------------------------------
-  uint16_t peaks[4];
-  readAllCalibrationPeaks(peaks, CAL_WINDOW);
-
+  // Look for a fresh event on the player currently being calibrated.
   const uint8_t target = calPlayer;
-  const uint16_t targetPeak = peaks[target];
+  bool found = false;
+  uint16_t targetPeak = 0;
 
-  uint16_t strongestOther = 0;
-  uint8_t strongestOtherPlayer = 255;
-
-  for (uint8_t p = 0; p < 4; p++) {
-    if (p == target) continue;
-    if (peaks[p] > strongestOther) {
-      strongestOther = peaks[p];
-      strongestOtherPlayer = p;
+  for (uint8_t i = 0; i < frameEventCount; i++) {
+    if (frameEvents[i].ch == target) {
+      targetPeak = frameEvents[i].strength;
+      found = true;
+      break;
     }
   }
 
-  uint16_t required = baseline[target] + BASELINE_MARGIN;
-  if (required < MIN_TAP_LEVEL) required = MIN_TAP_LEVEL;
+  if (!found) return;
 
-  bool targetStrongEnough = targetPeak >= required;
-  bool targetHasMargin = targetPeak >= strongestOther + CAL_CROSS_MARGIN;
-  bool targetHasDominance =
-    ((uint32_t)targetPeak * CAL_DOM_DEN >=
-     (uint32_t)strongestOther * CAL_DOM_NUM);
+  if (!evaluateCalibrationTap(target, targetPeak)) return;
 
-  // Diagnostic output whenever any sensor sees a meaningful signal.
-  if (targetPeak >= MIN_TAP_LEVEL || strongestOther >= MIN_TAP_LEVEL) {
-    Serial.print("CAL P");
-    Serial.print(target + 1);
-    Serial.print(" peaks: ");
+  // ----------------------------------------------------------
+  // ACCEPTED
+  // ----------------------------------------------------------
+  lastTap = millis();
+  tapPeaks[target][calTap] = targetPeak;
+  calTap++;
 
-    for (uint8_t p = 0; p < 4; p++) {
-      Serial.print("P"); Serial.print(p + 1);
-      Serial.print("="); Serial.print(peaks[p]);
-      if (p < 3) Serial.print("  ");
-    }
+  Serial.print("ACCEPTED: PLAYER "); Serial.print(target + 1);
+  Serial.print(" TAP "); Serial.print(calTap);
+  Serial.print("/"); Serial.print(TAPS_REQUIRED);
+  Serial.print(" peak="); Serial.println(targetPeak);
+
+  flashPixel(pixel.Color(PIXEL_BRIGHT, PIXEL_BRIGHT, PIXEL_BRIGHT), 70, pixel.Color(0,0,0));
+
+  if (calTap >= TAPS_REQUIRED) {
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < TAPS_REQUIRED; i++) sum += tapPeaks[target][i];
+    uint16_t avg = sum / TAPS_REQUIRED;
+
+    uint16_t th = (uint16_t)(avg * 0.30f);
+    if (th < MIN_TAP_LEVEL) th = MIN_TAP_LEVEL;
+
+    uint16_t baselineRequired = baseline[target] + BASELINE_MARGIN;
+    if (th < baselineRequired) th = baselineRequired;
+    if (th > MAX_TAP_THRESHOLD) th = MAX_TAP_THRESHOLD;
+
+    threshold[target] = th;
+
     Serial.println();
+    Serial.print("P"); Serial.print(target + 1); Serial.println(" CALIBRATION COMPLETE");
+    Serial.print("  Average="); Serial.println(avg);
+    Serial.print("  Final threshold="); Serial.println(th);
 
-    // If another player's sensor is stronger, this tap belongs to that
-    // player, so it MUST NOT advance the currently requested player.
-    if (strongestOtherPlayer != 255 && strongestOther > targetPeak) {
-      Serial.print("REJECTED: tap belongs to P");
-      Serial.print(strongestOtherPlayer + 1);
-      Serial.print("; only P");
-      Serial.print(target + 1);
-      Serial.println(" may calibrate now.");
-      return;
-    }
+    calPlayer++;
+    calTap = 0;
 
-    // If the target is strong but the source is ambiguous, reject it.
-    if (targetStrongEnough && (!targetHasMargin || !targetHasDominance)) {
-      Serial.print("REJECTED: P");
-      Serial.print(target + 1);
-      Serial.println(" signal is ambiguous/cross-coupled.");
-      Serial.print("Target="); Serial.print(targetPeak);
-      Serial.print(" OtherMax="); Serial.print(strongestOther);
-      Serial.print(" Required="); Serial.println(required);
-      return;
-    }
-  }
+    if (calPlayer < 4) {
+      state = CAL_WAIT;
+      calSwitchAt = millis() + CAL_SWITCH_DELAY;
 
-  // ----------------------------------------------------------
-  // ACCEPT ONLY THE ASSIGNED PLAYER'S SENSOR.
-  // ----------------------------------------------------------
-  if (targetStrongEnough && targetHasMargin && targetHasDominance) {
-    lastTap = millis();
-    tapPeaks[target][calTap] = targetPeak;
-    calTap++;
-
-    Serial.print("ACCEPTED: PLAYER ");
-    Serial.print(target + 1);
-    Serial.print(" TAP ");
-    Serial.print(calTap);
-    Serial.print("/");
-    Serial.print(TAPS_REQUIRED);
-    Serial.print(" peak=");
-    Serial.println(targetPeak);
-
-    flashPixel(
-      pixel.Color(PIXEL_BRIGHT, PIXEL_BRIGHT, PIXEL_BRIGHT),
-      70,
-      pixel.Color(0, 0, 0)
-    );
-
-    // --------------------------------------------------------
-    // PLAYER FINISHED ALL CALIBRATION TAPS
-    // --------------------------------------------------------
-    if (calTap >= TAPS_REQUIRED) {
-      uint32_t sum = 0;
-      for (uint8_t i = 0; i < TAPS_REQUIRED; i++) {
-        sum += tapPeaks[target][i];
+      if (displayOK) {
+        oled.clearBuffer();
+        oled.setFont(u8g2_font_7x14B_tf);
+        drawCentered("GOOD!", 18);
+        oled.setFont(u8g2_font_6x10_tf);
+        char msg[22];
+        snprintf(msg, sizeof(msg), "PLAYER %d NEXT", calPlayer + 1);
+        drawCentered(msg, 38);
+        drawCentered("GET READY...", 53);
+        oled.sendBuffer();
       }
 
-      uint16_t avg = sum / TAPS_REQUIRED;
-
-      uint16_t th = (uint16_t)(avg * 0.30f);
-      if (th < MIN_TAP_LEVEL) th = MIN_TAP_LEVEL;
-
-      uint16_t baselineRequired = baseline[target] + BASELINE_MARGIN;
-      if (th < baselineRequired) th = baselineRequired;
-      if (th > MAX_TAP_THRESHOLD) th = MAX_TAP_THRESHOLD;
-
-      threshold[target] = th;
-
-      Serial.println();
-      Serial.print("P"); Serial.print(target + 1);
-      Serial.println(" CALIBRATION COMPLETE");
-      Serial.print("  Peaks: ");
-      for (uint8_t i = 0; i < TAPS_REQUIRED; i++) {
-        Serial.print(tapPeaks[target][i]);
-        if (i < TAPS_REQUIRED - 1) Serial.print(", ");
-      }
-      Serial.println();
-      Serial.print("  Average="); Serial.println(avg);
-      Serial.print("  Final threshold="); Serial.println(th);
-
-      calPlayer++;
-      calTap = 0;
-
-      if (calPlayer < 4) {
-        state = CAL_WAIT;
-        calSwitchAt = millis() + CAL_SWITCH_DELAY;
-
-        if (displayOK) {
-          oled.clearBuffer();
-          oled.setFont(u8g2_font_7x14B_tf);
-          drawCentered("GOOD!", 18);
-          oled.setFont(u8g2_font_6x10_tf);
-
-          char msg[22];
-          snprintf(msg, sizeof(msg), "PLAYER %d NEXT", calPlayer + 1);
-          drawCentered(msg, 38);
-          drawCentered("GET READY...", 53);
-          oled.sendBuffer();
-        }
-
-        Serial.print("Next: ONLY P");
-        Serial.print(calPlayer + 1);
-        Serial.println(" may tap.");
-      } else {
-        state = CAL_WAIT;
-        calSwitchAt = millis() + 250;
-        Serial.println("P4 FINISHED.");
-        Serial.println("Calibration input CLOSED.");
-      }
+      Serial.print("Next: ONLY P"); Serial.print(calPlayer + 1); Serial.println(" may tap.");
     } else {
-      drawCalibration();
+      state = CAL_WAIT;
+      calSwitchAt = millis() + 250;
+      Serial.println("P4 FINISHED. Calibration input CLOSED.");
     }
+  } else {
+    drawCalibration();
   }
 }
 
@@ -633,52 +680,44 @@ void startReady() {
 
   if (!displayOK) return;
   oled.clearBuffer();
-
   oled.setFont(u8g2_font_6x10_tf);
   drawCentered("READY",9);
-
   for (uint8_t p=0;p<4;p++) drawPlayerSlot(p,false,false);
-
   drawBomb(64,34,true);
-
-  oled.setFont(u8g2_font_6x10_tf);
   drawCentered("TAP ANY SENSOR",62);
   oled.sendBuffer();
 
   Serial.println("=== READY: TAP ANY PLAYER ===");
 }
 
-int detectAnyTap() {
-  if (millis()-lastTap<TAP_COOLDOWN) return -1;
-
-  uint16_t peaks[4]={0,0,0,0};
-  unsigned long st=micros();
-
-  while (micros()-st < GAME_WINDOW*1000UL) {
-    for (uint8_t p=0;p<4;p++) {
-      uint16_t v=analogRead(PIEZO[p]);
-      if (v>peaks[p]) peaks[p]=v;
-    }
-  }
+// Looks at this frame's freshly-arrived events (already drained
+// into frameEvents by drainFifo()) rather than sampling the
+// piezos itself - Core 1 never touches the ADC.
+int detectAnyTapFromEvents(uint16_t *outPeak) {
+  if (millis()-lastTap < TAP_COOLDOWN) return -1;
 
   int best=-1;
   uint16_t bestMargin=0;
+  uint16_t bestPeak=0;
 
-  for (uint8_t p=0;p<4;p++) {
-    uint16_t needed=threshold[p];
-    if (peaks[p]>=needed) {
-      uint16_t margin=peaks[p]-needed;
+  for (uint8_t i=0;i<frameEventCount;i++) {
+    uint8_t ch = frameEvents[i].ch;
+    uint16_t v = frameEvents[i].strength;
+    if (v >= threshold[ch]) {
+      uint16_t margin = v - threshold[ch];
       if (best<0 || margin>bestMargin) {
-        best=p;
-        bestMargin=margin;
+        best = ch;
+        bestMargin = margin;
+        bestPeak = v;
       }
     }
   }
 
   if (best>=0) {
     lastTap=millis();
+    if (outPeak) *outPeak = bestPeak;
     Serial.print("TAP P"); Serial.print(best+1);
-    Serial.print(" peak="); Serial.print(peaks[best]);
+    Serial.print(" peak="); Serial.print(bestPeak);
     Serial.print(" threshold="); Serial.println(threshold[best]);
   }
   return best;
@@ -691,18 +730,16 @@ void startGame(uint8_t starter) {
     stunUntil[i]=0;
   }
 
-  // IMPORTANT: the player who tapped READY becomes the first holder.
   currentPlayer=starter;
   previousPlayer=starter;
   bombDuration=random(MIN_BOMB,MAX_BOMB+1);
   bombStart=millis();
-  lastTap=millis(); // prevents the same physical tap from passing immediately
+  lastTap=millis();
 
   state=PLAYING;
   stateStart=millis();
   nextBeep=0;
 
-  Serial.println("OLED -> PLAYING screen");
   enterPlayingEffects();
 
   Serial.println("\n=== GAME START ===");
@@ -738,7 +775,8 @@ void processGame() {
     if (stunned[p] && now>=stunUntil[p]) stunned[p]=false;
   }
 
-  int tap=detectAnyTap();
+  uint16_t tapPeak;
+  int tap = detectAnyTapFromEvents(&tapPeak);
 
   if (tap>=0 && alive[tap]) {
     if (tap==currentPlayer) {
@@ -778,7 +816,6 @@ void drawGameplay() {
   for (uint8_t p=0;p<4;p++) {
     drawPlayerSlot(p,p==currentPlayer,!alive[p]);
     if (stunned[p] && alive[p]) {
-      // small "Z" marker inside the player's own corner
       oled.setFont(u8g2_font_5x7_tf);
       oled.drawStr(PX[p]+20,PY[p]+7,"Z");
     }
@@ -881,7 +918,6 @@ void processExplosion() {
 
   if (displayOK) {
     oled.clearBuffer();
-
     for (uint8_t p=0;p<4;p++)
       if (p!=currentPlayer) drawPlayerSlot(p,false,!alive[p]);
 
@@ -959,8 +995,8 @@ void startWin() {
 
 void processWin() {
   static unsigned long pulse=0;
+  static bool bright=false;
   if (millis()>=pulse) {
-    static bool bright=false;
     bright=!bright;
     setPixel(playerColor(winnerPlayer,bright?PIXEL_BRIGHT:PIXEL_DIM));
     pulse=millis()+250;
@@ -972,7 +1008,7 @@ void processWin() {
 }
 
 // ============================================================
-// GRAPHICS - deliberately separated into non-overlapping regions
+// GRAPHICS
 // ============================================================
 void drawPlayerIcon(int cx,int cy,bool elim,bool active) {
   if (active) {
@@ -985,7 +1021,6 @@ void drawPlayerIcon(int cx,int cy,bool elim,bool active) {
     return;
   }
 
-  // compact pixel-art person: 11x15, fits corner slots
   oled.drawBox(cx-3,cy-7,7,6);
   oled.drawBox(cx-5,cy,11,8);
   oled.drawBox(cx-7,cy+2,2,5);
@@ -1007,7 +1042,6 @@ void drawPlayerSlot(uint8_t p,bool holder,bool elim) {
   char label[4];
   snprintf(label,sizeof(label),"P%d",p+1);
 
-  // label sits at the outer edge, icon stays inside the slot
   if (p==0 || p==3) oled.drawStr(PX[p],PY[p]+6,label);
   else {
     int w=oled.getStrWidth(label);
@@ -1018,7 +1052,6 @@ void drawPlayerSlot(uint8_t p,bool holder,bool elim) {
 }
 
 void drawBomb(int x,int y,bool burst) {
-  // compact bomb: no text around it, so it stays inside the center zone
   oled.drawDisc(x,y,5);
   oled.drawLine(x+3,y-5,x+6,y-9);
   oled.drawPixel(x+7,y-10);
@@ -1154,10 +1187,12 @@ uint8_t randomOtherAlive(uint8_t from) {
   return list[random(0,n)];
 }
 
+// Seeds from Core 0's continuously-refreshed snapshot plus micros() -
+// no direct ADC access from Core 1.
 void seedRandom() {
   uint32_t seed=micros();
   for (uint8_t i=0;i<4;i++) {
-    seed ^= ((uint32_t)analogRead(PIEZO[i]) << (i*8));
+    seed ^= ((uint32_t)currentReading[i] << (i*8));
   }
   randomSeed(seed);
 }
